@@ -80,6 +80,16 @@ impl ShowBy {
     /// Whether the show hands KiCad the keyboard: only the person's; an agent's never takes it from the composer.
     pub fn takes_keys(self) -> bool { self == ShowBy::Deliberate }
 }
+/// #1389: the show the pane waits for after asking the hub for `kind`: none when the hub's active frame is that already (its answer
+/// changes nothing, so nothing would clear the wait, and the next change of the hub's frame, KiCad's own editor request, was then not
+/// followed). Pure.
+pub fn pending_for(hub_active: Option<&str>, kind: &str) -> Option<String> { (hub_active != Some(kind)).then(|| kind.to_string()) }
+/// #1389: whether a KiCad window that took the foreground is one of KiCad's library editors in this session (its frames as the hub lists
+/// them, kind `SYMBOL_EDITOR` / `FOOTPRINT_EDITOR`): KiCad opening the editor the person asked for (Ctrl+E), never a stray. The F5
+/// guard's own case, a pre-warmed hidden Schematic or Board frame, is not one. Pure.
+pub fn library_editor(info: &Value, window: u64) -> bool {
+    info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(window) && matches!(f["kind"].as_str(), Some("SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))
+}
 /// KiCad's Simulator frame (bp.13.2, capability `sim-frame`): the rail's Simulation entry opens the pane on it.
 pub const SIM: &str = "SIMULATOR"; // i18n-ok: wire frame kind
 /// The frame the rail's Simulation entry opens, from the hub's viewer (`simFrame`: its KiCad embeds the Simulator and the project has a
@@ -831,7 +841,7 @@ impl KicadPane {
         if self.attached && matches!(self.info["state"].as_str(), Some("stopped" | "failed")) { self.reattach(); }
         else if self.attached && self.locally_shown(kind) { self.placed = None; }
         else if self.attached {
-            self.pending_show = (self.info["active"].as_str() != Some(kind)).then(|| kind.to_string());
+            self.pending_show = pending_for(self.info["active"].as_str(), kind);
             self.rpc("editor.kicad.show", json!({"project": self.project, "frame": kind, "focus": self.keys}));
         }
         cx.notify();
@@ -931,7 +941,7 @@ impl KicadPane {
         self.placed = None;
         if self.attached && matches!(self.info["state"].as_str(), Some("stopped" | "failed")) { self.reattach(); }
         else if self.attached && self.locally_shown(kind) {}
-        else if self.attached { self.pending_show = Some(kind.to_string()); self.rpc("editor.kicad.show", json!({"project": self.project, "frame": kind})); }
+        else if self.attached { self.pending_show = pending_for(self.info["active"].as_str(), kind); self.rpc("editor.kicad.show", json!({"project": self.project, "frame": kind})); }
         cx.notify();
     }
     /// bp.10+ local map: `kind`'s frame is one KiCad has shown or pre-warmed, so the client maps it itself and asks KiCad nothing. A hub
@@ -1063,7 +1073,7 @@ impl KicadPane {
             } else {
                 let mut last = last_stray;
                 if let (true, Some(w)) = (self.keys, self.want()) {
-                    if let Some((stray, title)) = nc::invisible_kicad_foreground(w) {
+                    if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) {
                         if stray != last_stray {
                             last = stray;
                             eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "during": "prewarm", "after_prewarm_request_ms": started.elapsed().as_millis() as u64}}));
@@ -1391,7 +1401,7 @@ impl KicadPane {
         }
         if let Some((w, since)) = self.verify_handin {
             if !self.keys || show != Some(w) || since.elapsed() > std::time::Duration::from_millis(1500) { self.verify_handin = None; }
-            else if let Some((stray, title)) = nc::invisible_kicad_foreground(w) {
+            else if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) {
                 self.verify_handin = None;
                 eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "after_ms": since.elapsed().as_millis() as u64}}));
                 nc::focus(w);
@@ -1721,6 +1731,18 @@ impl Render for KicadPane {
 
 #[cfg(test)]
 mod tests {
+    #[test] fn a_show_waits_only_when_the_hub_is_on_another_frame() {
+        assert_eq!(super::pending_for(Some("PCB"), "PCB"), None, "the hub is on the board already: nothing to wait for (#1389 fp1: the wait never cleared)");
+        assert_eq!(super::pending_for(Some("SCH"), "PCB").as_deref(), Some("PCB"));
+        assert_eq!(super::pending_for(None, "PCB").as_deref(), Some("PCB"), "the hub's frame not known yet: wait for it");
+    }
+    #[test] fn a_library_editor_kicad_opened_is_never_a_stray() {
+        use serde_json::json;
+        let info = json!({"frames": [{"kind": "SCH", "xid": 11}, {"kind": "PCB", "xid": 12}, {"kind": "SYMBOL_EDITOR", "xid": 13}, {"kind": "FOOTPRINT_EDITOR", "xid": 14}]});
+        assert!(super::library_editor(&info, 13) && super::library_editor(&info, 14), "Ctrl+E's editors");
+        assert!(!super::library_editor(&info, 11) && !super::library_editor(&info, 12), "a pre-warmed Schematic or Board (F5's own case) still is");
+        assert!(!super::library_editor(&info, 99), "a window not KiCad's frame");
+    }
     #[test] fn only_the_persons_show_hands_kicad_the_keyboard() {
         use super::ShowBy;
         assert!(ShowBy::Deliberate.takes_keys(), "a tab, a key, the rail: the person chose the editor");
