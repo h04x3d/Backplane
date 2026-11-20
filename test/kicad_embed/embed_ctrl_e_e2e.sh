@@ -92,6 +92,7 @@ ctrl_e() { local tab=$1 kind=$2 ref=$3 word=$4 ed=$5
   python3 "$RT" key e ctrl >/dev/null; sleep 6
   local T; T=$(titles); local TB; TB=$(last_tab)
   echo "INFO $ed: windows on show [$T], client tab $TB"
+  echo "INFO $ed: full titles: $(python3 "$DRIVER_PY" list-windows --pid "$KP" 2>/dev/null | python3 -c 'import json,sys; print(" | ".join(w.get("title") or "" for w in json.load(sys.stdin) if w.get("shown") and w.get("w",0)>=200))' 2>/dev/null)"
   tail -n +"$((L + 1))" "$OUT/hub.log" | grep -a "editor request\|EDITOR_REQUESTED\|ShowFrame\|show request\|followed\|waits for its editor request" | head -12 | sed 's/^/INFO hub: /' || true
   check "$ed: Ctrl+E on $ref opened KiCad's $word and it is on show in the pane ([$T])" "$(echo "$T" | grep -q "$word" && echo 1 || echo 0)"
   check "$ed: the client's tab is $ed (not back on $tab: $TB)" "$([ "$TB" = "$ed" ] && echo 1 || echo 0)"

@@ -128,6 +128,11 @@ pub struct Session {
     /// latest's timer acts) and when KiCad last asked to show a library editor
     pub lib_opened: Option<(String, std::time::Instant)>, pub lib_asked: Option<(String, std::time::Instant)>,
     pub lib_wait: (u64, Option<std::time::Instant>),
+    /// the library editor the fallback put on show and when: KiCad's editor request for it that comes after (Linux's Symbol Editor asks
+    /// ~1.8 s after its show requests, once its libraries are loaded) is not shown a second time
+    pub lib_followed: Option<(String, std::time::Instant)>,
+    /// how many times the hub showed a library editor on KiCad's asking (an editor request or the fallback): one per Ctrl+E (tests)
+    pub lib_shows: u32,
 }
 
 impl Session {
@@ -138,7 +143,7 @@ impl Session {
             container: 0, toplevel: 0, holder: 0, display: String::new(), start_phase: String::new(), start_at: 0, lock_ask: Value::Null,
             sock: String::new(), events_sock: String::new(), sock_dir: String::new(),
             argv: String::new(), cli: String::new(), version: String::new(), desc: String::new(),
-            caps: vec![], frames: vec![], missed_pings: 0, dialogs: vec![], notices: vec![], drawn: vec![], keys: vec![], rss_mb: 0, peak_mb: 0, mem_pub: (0, 0), peak_logged: false, stop_reason: String::new(), stopped_at: 0, closed_frames: vec![], pane_cid: String::new(), task_wait: String::new(), parked: false, touched_at: now, closing: false, lost_parent: false, editor_req: (String::new(), String::new(), None), lib_opened: None, lib_asked: None, lib_wait: (0, None),
+            caps: vec![], frames: vec![], missed_pings: 0, dialogs: vec![], notices: vec![], drawn: vec![], keys: vec![], rss_mb: 0, peak_mb: 0, mem_pub: (0, 0), peak_logged: false, stop_reason: String::new(), stopped_at: 0, closed_frames: vec![], pane_cid: String::new(), task_wait: String::new(), parked: false, touched_at: now, closing: false, lost_parent: false, editor_req: (String::new(), String::new(), None), lib_opened: None, lib_asked: None, lib_wait: (0, None), lib_followed: None, lib_shows: 0,
         }
     }
     pub fn spawned(mut self, pid: u32) -> Self { self.pid = pid; self }
@@ -562,6 +567,8 @@ pub const LIB_ASKED: Duration = Duration::from_secs(5);
 /// follows the show itself. Measured from the last ET_SHOW_REQUESTED to Footprint's ET_EDITOR_REQUESTED on Ctrl+E: Windows bp.13.2
 /// 482, 723, 535 ms (Carbon, 864e77dba9); see the PR for Linux and macOS.
 pub const LIB_EDITOR_WAIT: Duration = Duration::from_millis(1000);
+/// #1389: how long after the fallback showed a library editor KiCad's own editor request for it is taken as that same show's.
+pub const LIB_LATE: Duration = Duration::from_secs(15);
 /// #1389: whether KiCad's plain show request for library editor `kind` waits for the fallback (followed after LIB_EDITOR_WAIT unless its
 /// ET_EDITOR_REQUESTED comes first). Bare Windows bp.13.2 opens the Symbol Editor on Ctrl+E without ET_EDITOR_REQUESTED (Footprint
 /// sends it), and with embed-editor-requested a library editor's plain show was never followed: the pane stayed on the schematic.
@@ -2691,6 +2698,14 @@ impl Actor {
                         eprintln!("kicad embed: {pro}: {kind} editor request {} ms after KiCad's last show request for it", s.lib_wait.1.map_or(-1, |t| now.duration_since(t).as_millis() as i64));
                     }
                     s.lib_wait = (s.lib_wait.0 + 1, None);
+                    // the fallback showed this editor already: KiCad's late request is noted (its item, so an echo is no new show), not shown again
+                    let k = canon_frame(&kind);
+                    if let Some(after) = s.lib_followed.take().filter(|(f, t)| s.active == k && f == k && now.duration_since(*t) < LIB_LATE).map(|(_, t)| now.duration_since(t)) {
+                        eprintln!("kicad embed: {pro}: {kind} editor request {} ms after the fallback had shown it: not shown again (#1389)", after.as_millis());
+                        s.editor_req = (k.to_string(), item.clone(), Some(now));
+                        let _ = self.me.send(Msg::ForkSync { pro, gen });
+                        return;
+                    }
                 }
                 if lib && !editor && why != Some("an API client's") && s.caps.iter().any(|c| c == "embed-editor-requested") {
                     // #1389: a fresh open by KiCad whose ET_EDITOR_REQUESTED may never come (bare Windows bp.13.2's Symbol Editor on Ctrl+E):
@@ -2731,6 +2746,7 @@ impl Actor {
                     s.editor_req = Default::default();
                 }
                 s.active = canon_frame(&kind).into();
+                if lib { s.lib_shows += 1; }
                 let snap = s.clone();
                 let me = self.me.clone();
                 tokio::spawn(async move {
@@ -2745,6 +2761,8 @@ impl Actor {
                 if s.lib_wait.0 != turn || s.active == kind || s.pane_cid.is_empty() || s.container == 0 || s.parked { return }
                 eprintln!("kicad embed: {pro}: KiCad's {kind} show request had no editor request in {} ms: followed (#1389)", LIB_EDITOR_WAIT.as_millis());
                 s.lib_wait.1 = None;
+                s.lib_followed = Some((kind.clone(), std::time::Instant::now()));
+                s.lib_shows += 1;
                 s.editor_req = Default::default();
                 s.active = kind;
                 let snap = s.clone();
@@ -4712,14 +4730,20 @@ mod tests {
         assert_eq!(a.sessions[&pro].active, "SYMBOL_EDITOR", "followed");
         let turn = a.sessions[&pro].lib_wait.0;
         assert_eq!(turn, 2, "only the last show's timer acted (the first was stale)");
+        // KiCad's editor request comes after the fallback's show (Linux's Symbol Editor, ~1.8 s): noted, not shown a second time
+        a.handle(show(true, "Device:R"));
+        assert_eq!(a.sessions[&pro].editor_req.1, "Device:R", "the late request is noted");
+        assert!(a.sessions[&pro].lib_followed.is_none(), "taken by the late request");
+        assert_eq!(a.sessions[&pro].lib_shows, 1, "one show for the one Ctrl+E: the late request did not show it again");
 
         // 2. back on the schematic; opened + show, then the editor request within the wait: shown on the request, no second show
         a.sessions.get_mut(&pro).unwrap().active = "SCH".into();
-        a.handle(opened()); a.handle(show(false, "")); a.handle(show(true, "Device:R"));
+        a.handle(opened()); a.handle(show(false, "")); a.handle(show(true, "Device:C"));
         assert_eq!(a.sessions[&pro].active, "SYMBOL_EDITOR");
-        assert_eq!(a.sessions[&pro].editor_req.1, "Device:R");
+        assert_eq!(a.sessions[&pro].editor_req.1, "Device:C");
         for m in fallbacks(&mut rx, wait).await { a.handle(m); }
-        assert_eq!(a.sessions[&pro].editor_req.1, "Device:R", "the fallback did not show it a second time");
+        assert_eq!(a.sessions[&pro].editor_req.1, "Device:C", "the fallback did not show it a second time");
+        assert_eq!(a.sessions[&pro].lib_shows, 2, "the request's one show, and none from the fallback");
 
         // 3. the hub asked for the Symbol Editor itself: KiCad's open and show are not followed as KiCad's
         a.sessions.get_mut(&pro).unwrap().active = "SCH".into();
