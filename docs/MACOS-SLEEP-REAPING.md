@@ -1,6 +1,10 @@
 # macOS: sleep and child processes
 
-Two macOS faults this branch fixes, and how.
+## How it started
+
+On a Mac laptop, strange timeouts showed up whenever the computer had been asleep. The hub restarted itself overnight with "stopped answering" or "start stalled for 1054 s", the guard reported health checks as `hung`, and design-history captures timed out after 120 s. Nothing like this happens on Linux or Windows.
+
+Looking into it turned up two separate faults, both specific to macOS. This branch fixes both.
 
 ## 1. A sleeping Mac looked like a hung hub
 
