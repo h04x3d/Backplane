@@ -344,7 +344,7 @@ impl Rpc {
         self.stdin.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n").await.map_err(|_| ())
     }
     /// Killed, and its exit waited for a moment only: a missed exit (#1108) must not hold the op that closes it.
-    async fn close(mut self) { let _ = self.child.start_kill(); let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await; }
+    async fn close(mut self) { let _ = self.child.start_kill(); if tokio::time::timeout(Duration::from_secs(3), crate::proc::wait(&mut self.child)).await.is_err() { crate::proc::kill_and_reap(self.child) } }
 }
 /// The variables that point a CLI at one profile's store (`environment` sets them). The default login never inherits them: a hub started from a shell that
 /// ran under a profile (an agent's own Bash, after failover moved it) would otherwise run every default-login thread, and read its usage, under that profile.
@@ -511,9 +511,9 @@ impl Accounts {
         let ran = tokio::time::timeout(limit, async {
             let mut chunk = [0u8; 8192];
             loop { let n = out.read(&mut chunk).await.map_err(|_| ())?; if n == 0 { break } buf.extend_from_slice(&chunk[..n]); if buf.len() > 131072 { return Err(()) } }
-            Ok::<i32, ()>(child.wait().await.map_err(|_| ())?.code().unwrap_or(-1))
+            Ok::<i32, ()>(crate::proc::wait(&mut child).await.map_err(|_| ())?.code().unwrap_or(-1))
         }).await;
-        let code = match ran { Ok(Ok(code)) => code, _ => { let _ = child.start_kill(); return Err(()) } };
+        let code = match ran { Ok(Ok(code)) => code, _ => { crate::proc::kill_and_reap(child); return Err(()) } };
         let data = if args.get(1) == Some(&"logout") { json!({}) } else { serde_json::from_slice(&buf).map_err(|_| ())? };
         Ok((code, data))
     }
@@ -548,7 +548,7 @@ impl Accounts {
             }
             Err("The Claude CLI closed before reporting usage.".to_string())
         }).await.unwrap_or_else(|_| Err("The Claude CLI did not answer within 30 seconds.".to_string()));
-        let _ = child.start_kill(); r
+        crate::proc::kill_and_reap(child); r // reaped, not dropped: a dropped child waits on a SIGCHLD a macOS hub was seen missing (one zombie per usage read)
     }
     /// A test's usage request and CLI store (the real hub's are set in `open`).
     #[cfg(test)]

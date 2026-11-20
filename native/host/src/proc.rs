@@ -220,6 +220,43 @@ pub fn probe_output(mut c: std::process::Command, limit: std::time::Duration) ->
 pub fn kicad_probe_tokio<S: AsRef<OsStr>>(cli: S) -> (tokio::process::Command, ProbeHome) {
     let h = ProbeHome::new(); let mut c = tokio_cmd(Kind::Local, cli); c.envs(h.env()); (c, h)
 }
+/// How often [`wait`] asks a child whether it has exited, at most.
+const WAIT_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+/// A tokio child's exit, without depending on SIGCHLD. tokio's own `wait()` asks once and then waits for SIGCHLD; on Linux it has a pidfd for
+/// each child, but on macOS that signal is all it has, and a hub there was seen missing every exit that came after the first ask (#1108: 62
+/// unreaped children after 11 hours, a SIGCHLD sent by hand reaping none of them). So the exit is also asked for (`try_wait`, a `waitpid` on
+/// this child's pid through tokio, which cannot take another child's status) every few ms at first, then every 250 ms; whichever comes first wins.
+pub async fn wait(child: &mut tokio::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    let mut gap = std::time::Duration::from_millis(5);
+    loop {
+        if let Some(s) = child.try_wait()? { return Ok(s) }
+        tokio::select! {
+            s = child.wait() => return s,
+            _ = tokio::time::sleep(gap) => {}
+        }
+        gap = (gap * 2).min(WAIT_POLL_MAX);
+    }
+}
+/// `Command::output`, with the exit taken by [`wait`]: stdout and stderr read to their ends (both at once, so neither pipe fills), then the exit.
+pub async fn output(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn()?;
+    let (mut o, mut e) = (child.stdout.take(), child.stderr.take());
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let read_o = async { if let Some(p) = o.as_mut() { p.read_to_end(&mut stdout).await.map(|_| ()) } else { Ok(()) } };
+    let read_e = async { if let Some(p) = e.as_mut() { p.read_to_end(&mut stderr).await.map(|_| ()) } else { Ok(()) } };
+    let (ro, re) = tokio::join!(read_o, read_e); ro?; re?;
+    let status = wait(&mut child).await?;
+    Ok(std::process::Output { status, stdout, stderr })
+}
+/// A child that was killed and is no longer needed: kill it, then reap it in the background with [`wait`] (for at most a minute), instead of
+/// dropping it to tokio's orphan queue, which is only drained on a SIGCHLD (the same signal a macOS hub was seen missing).
+pub fn kill_and_reap(mut child: tokio::process::Child) {
+    let _ = child.start_kill();
+    tokio::spawn(async move { let _ = tokio::time::timeout(std::time::Duration::from_secs(60), wait(&mut child)).await; });
+}
+
 /// `std::process::Command::new`, gated.
 pub fn std_cmd<S: AsRef<OsStr>>(kind: Kind, program: S) -> std::process::Command {
     let p = program.as_ref().to_string_lossy().into_owned();
@@ -236,6 +273,21 @@ pub fn std_cmd<S: AsRef<OsStr>>(kind: Kind, program: S) -> std::process::Command
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)] #[tokio::test] async fn a_childs_exit_is_taken_without_sigchld_and_a_killed_child_is_reaped() {
+        let mut c = tokio::process::Command::new("sh"); c.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let o = output(&mut c).await.unwrap();
+        assert_eq!((o.status.code(), o.stdout.as_slice(), o.stderr.as_slice()), (Some(3), &b"out"[..], &b"err"[..]));
+        // a child still running when it is waited for: the exit comes by asking, as it must where SIGCHLD is missed
+        let mut ch = tokio::process::Command::new("sh").args(["-c", "sleep 0.3"]).spawn().unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), wait(&mut ch)).await.unwrap().unwrap().success());
+        // killed and handed over: reaped in the background, not left as a zombie
+        let ch = tokio::process::Command::new("sleep").arg("30").spawn().unwrap(); let pid = ch.id().unwrap() as i32;
+        kill_and_reap(ch);
+        let mut gone = false;
+        for _ in 0..100 { tokio::time::sleep(std::time::Duration::from_millis(20)).await; if unsafe { libc::kill(pid, 0) } != 0 { gone = true; break } }
+        assert!(gone, "the killed child was reaped");
+    }
 
     #[test] fn on_macos_every_child_but_a_terminal_gets_kicads_documents_folder_unless_the_hub_was_given_one() {
         let d = std::path::Path::new("/h/kicad/documents");
