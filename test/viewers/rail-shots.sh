@@ -571,7 +571,7 @@ PY
     BACKPLANE_GPUI_ASSETS="$ASSETS_DIR" \
     BACKPLANE_GPUI_RECTS=1 \
     BACKPLANE_GPUI_SHOT_DIR="$SHOT_DIR" \
-    "$CLIENT_BIN" --url "http://127.0.0.1:$PORT" --token-file "$HHOME/token" --script "$SCRIPT_JSON" --exit-after 420 >"$KIND_OUT/client.log" 2>&1
+    "$CLIENT_BIN" ${RAIL_THEME:+--theme "$RAIL_THEME"} --url "http://127.0.0.1:$PORT" --token-file "$HHOME/token" --script "$SCRIPT_JSON" --exit-after 420 >"$KIND_OUT/client.log" 2>&1
   CLIENT_PG=$!
 
   set +e
