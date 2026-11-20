@@ -1146,6 +1146,15 @@ impl KicadPane {
         }
         let want = self.wanted_kind().to_string();
         // fork KiCad: if the placed frame stayed unmapped (e.g. cold-start wxGTK decor-extents deferral), ask the hub to remount it once cooldown passes.
+        if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() {
+            // what the check below sees, logged when it changes: one run names the precondition that keeps it from firing
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let placed = self.placed.as_ref().map(|(at, w, _)| json!({"at": at.is_some(), "window": w}));
+            let visible = self.placed.as_ref().and_then(|(_, w, _)| *w).map(|w| json!({"report": nc::report(w).map(|(_, on, _)| on), "frame_windows": self.frames.iter().map(|f| f.window).collect::<Vec<_>>()}));
+            let line = json!({"kicad_unmapped_check": {"mode": self.info["mode"], "state": self.info["state"], "pending_show": self.pending_show, "placed": placed, "visible": visible, "want": &want, "hub_active": self.info["active"]}}).to_string();
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != line { eprintln!("GPUI_LOG {line}"); *last = line; }
+        }
         if self.info["mode"] == "fork" && self.info["state"] == "ready" && self.pending_show.is_none() {
             if let Some((Some(_), Some(w), _)) = &self.placed {
                 if nc::report(*w).is_some_and(|(_, on, _)| !on) {
