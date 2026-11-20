@@ -573,14 +573,25 @@ pub const LIB_LATE: Duration = Duration::from_secs(15);
 /// ET_EDITOR_REQUESTED comes first). Bare Windows bp.13.2 opens the Symbol Editor on Ctrl+E without ET_EDITOR_REQUESTED (Footprint
 /// sends it), and with embed-editor-requested a library editor's plain show was never followed: the pane stayed on the schematic.
 /// Only for a fresh open by KiCad (its ET_FRAME_OPENED of that kind just before), never one the hub asked for itself (a show or an
-/// attach of it in flight), and only while a pane holds KiCad (never during a start with no pane, never a warm-up's frames). Pure.
+/// attach of it in flight), and only while a pane holds KiCad (never during a start with no pane, never a warm-up's frames). Windows only
+/// (`windows`: the hub's platform): macOS sends the request within ~140 ms and Linux's Symbol Editor at ~1.8 s, once its libraries are
+/// loaded, so there it would only show the editor earlier than KiCad asks. It goes away when the fork sends the request on that road. Pure.
+/// Whether this hub's platform takes #1389's fallback: Windows; a test turns it on elsewhere (FORCE_FALLBACK, its own thread only).
+fn fallback_platform() -> bool {
+    #[cfg(test)]
+    if FORCE_FALLBACK.with(|f| f.get()) { return true }
+    cfg!(windows)
+}
+#[cfg(test)]
+thread_local! { static FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// The hub itself asks for `frame` (a show, an attach): a library editor's open is the hub's, never followed as KiCad's (lib_show_fallback).
 fn note_lib_asked(s: &mut Session, frame: &str) {
     let k = canon_frame(frame);
     if matches!(k, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR") { s.lib_asked = Some((k.to_string(), std::time::Instant::now())); }
 }
-fn lib_show_fallback(kind: &str, opened: Option<&(String, std::time::Instant)>, asked: Option<&(String, std::time::Instant)>, pane_holds: bool, now: std::time::Instant) -> bool {
-    matches!(kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")
+fn lib_show_fallback(windows: bool, kind: &str, opened: Option<&(String, std::time::Instant)>, asked: Option<&(String, std::time::Instant)>, pane_holds: bool, now: std::time::Instant) -> bool {
+    windows
+        && matches!(kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")
         && pane_holds
         && opened.is_some_and(|(k, t)| k == kind && now.saturating_duration_since(*t) <= LIB_FRESH)
         && !asked.is_some_and(|(k, t)| k == kind && now.saturating_duration_since(*t) <= LIB_ASKED)
@@ -2712,7 +2723,7 @@ impl Actor {
                     // followed after LIB_EDITOR_WAIT from KiCad's last show request unless the editor request comes first (lib_show_fallback)
                     let k = canon_frame(&kind).to_string();
                     let pane_holds = !s.pane_cid.is_empty() && s.container != 0 && !s.parked;
-                    if s.active != k && lib_show_fallback(&k, s.lib_opened.as_ref(), s.lib_asked.as_ref(), pane_holds, now) {
+                    if s.active != k && lib_show_fallback(fallback_platform(), &k, s.lib_opened.as_ref(), s.lib_asked.as_ref(), pane_holds, now) {
                         s.lib_wait = (s.lib_wait.0 + 1, Some(now));
                         let (me, turn, p2) = (self.me.clone(), s.lib_wait.0, pro.clone());
                         tokio::spawn(async move {
@@ -4679,15 +4690,16 @@ mod tests {
         let now = std::time::Instant::now();
         let at = |ms: u64| now - Duration::from_millis(ms);
         let o = |k: &str, ms: u64| Some((k.to_string(), at(ms)));
-        assert!(lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, true, now));
-        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, false, now), "no pane: never");
-        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 3000).as_ref(), None, true, now), "an open long before: not this show's");
-        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("FOOTPRINT_EDITOR", 0).as_ref(), None, true, now), "another editor opened");
-        assert!(!lib_show_fallback("SYMBOL_EDITOR", None, None, true, now), "no open seen");
-        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 500).as_ref(), true, now), "the hub asked for it");
-        assert!(lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 6000).as_ref(), true, now), "the hub's ask long done");
-        assert!(lib_show_fallback("FOOTPRINT_EDITOR", o("FOOTPRINT_EDITOR", 100).as_ref(), o("SYMBOL_EDITOR", 0).as_ref(), true, now));
-        assert!(!lib_show_fallback("SCH", o("SCH", 0).as_ref(), None, true, now), "only library editors");
+        assert!(lib_show_fallback(true, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, true, now));
+        assert!(!lib_show_fallback(true, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, false, now), "no pane: never");
+        assert!(!lib_show_fallback(true, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 3000).as_ref(), None, true, now), "an open long before: not this show's");
+        assert!(!lib_show_fallback(true, "SYMBOL_EDITOR", o("FOOTPRINT_EDITOR", 0).as_ref(), None, true, now), "another editor opened");
+        assert!(!lib_show_fallback(true, "SYMBOL_EDITOR", None, None, true, now), "no open seen");
+        assert!(!lib_show_fallback(true, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 500).as_ref(), true, now), "the hub asked for it");
+        assert!(lib_show_fallback(true, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 6000).as_ref(), true, now), "the hub's ask long done");
+        assert!(lib_show_fallback(true, "FOOTPRINT_EDITOR", o("FOOTPRINT_EDITOR", 100).as_ref(), o("SYMBOL_EDITOR", 0).as_ref(), true, now));
+        assert!(!lib_show_fallback(true, "SCH", o("SCH", 0).as_ref(), None, true, now), "only library editors");
+        assert!(!lib_show_fallback(false, "SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, true, now), "not on macOS or Linux: their request comes");
     }
 
     /// #1389's fallback through the actor, as a stand-in KiCad's events reach it: opened + show with no editor request is followed once
@@ -4720,6 +4732,8 @@ mod tests {
         let show = |editor: bool, item: &str| Msg::ForkShowRequested { pro: pro.clone(), gen: 1, kind: "SYMBOL_EDITOR".into(), item: item.into(), editor, actor: String::new() };
         let opened = || Msg::FrameOpen { pro: pro.clone(), gen: 1, kind: "SYMBOL_EDITOR".into(), open: true };
         let wait = LIB_EDITOR_WAIT.as_millis() as u64 + 400;
+        // the Windows branch on any platform (this test's thread only); the other branch is case 5
+        FORCE_FALLBACK.with(|f| f.set(true));
 
         // 1. opened + two shows, no editor request, under the pre-warm's hold: followed once, the last show's turn
         hold_shows(&pro, Duration::from_secs(60));
@@ -4756,6 +4770,15 @@ mod tests {
         { let s = a.sessions.get_mut(&pro).unwrap(); s.lib_asked = None; s.pane_cid.clear(); }
         a.handle(opened()); a.handle(show(false, ""));
         assert!(fallbacks(&mut rx, wait).await.is_empty(), "no pane holds KiCad: not followed");
+
+        // 5. macOS and Linux (their request comes): no fallback, as before #1389
+        if !cfg!(windows) {
+            FORCE_FALLBACK.with(|f| f.set(false));
+            { let s = a.sessions.get_mut(&pro).unwrap(); s.pane_cid = "c1".into(); s.active = "SCH".into(); }
+            a.handle(opened()); a.handle(show(false, ""));
+            assert!(fallbacks(&mut rx, wait).await.is_empty(), "not this platform's: KiCad's request is waited for");
+            assert_eq!(a.sessions[&pro].active, "SCH");
+        }
     }
 
     #[test] fn a_shown_project_is_kept_warm_within_the_cap_memory_and_locks() {
