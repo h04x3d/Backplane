@@ -88,7 +88,7 @@ pub fn pending_for(hub_active: Option<&str>, kind: &str) -> Option<String> { (hu
 /// them, kind `SYMBOL_EDITOR` / `FOOTPRINT_EDITOR`): KiCad opening the editor the person asked for (Ctrl+E), never a stray. The F5
 /// guard's own case, a pre-warmed hidden Schematic or Board frame, is not one. Pure.
 pub fn library_editor(info: &Value, window: u64) -> bool {
-    info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(window) && matches!(f["kind"].as_str(), Some("SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))
+    info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(window) && matches!(f["kind"].as_str(), Some("SYMBOL_EDITOR" | "FOOTPRINT_EDITOR"))) // i18n-ok: wire frame kind enum names
 }
 /// KiCad's Simulator frame (bp.13.2, capability `sim-frame`): the rail's Simulation entry opens the pane on it.
 pub const SIM: &str = "SIMULATOR"; // i18n-ok: wire frame kind
@@ -1073,7 +1073,7 @@ impl KicadPane {
             } else {
                 let mut last = last_stray;
                 if let (true, Some(w)) = (self.keys, self.want()) {
-                    if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) {
+                    if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) { // i18n-ok: wire frame kind enum names
                         if stray != last_stray {
                             last = stray;
                             eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "during": "prewarm", "after_prewarm_request_ms": started.elapsed().as_millis() as u64}}));
@@ -1410,7 +1410,7 @@ impl KicadPane {
         }
         if let Some((w, since)) = self.verify_handin {
             if !self.keys || show != Some(w) || since.elapsed() > std::time::Duration::from_millis(1500) { self.verify_handin = None; }
-            else if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) {
+            else if let Some((stray, title)) = nc::invisible_kicad_foreground(w).filter(|(s, _)| !(library_editor(&self.info, *s) || self.frames.iter().any(|f| f.window == *s && matches!(f.kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")))) { // i18n-ok: wire frame kind enum names
                 self.verify_handin = None;
                 eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "after_ms": since.elapsed().as_millis() as u64}}));
                 nc::focus(w);
