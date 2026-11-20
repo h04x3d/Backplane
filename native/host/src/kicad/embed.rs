@@ -123,6 +123,11 @@ pub struct Session {
     /// the library editor and item last shown on KiCad's ET_EDITOR_REQUESTED: the same request again is not shown again (a ShowFrame on
     /// the item makes KiCad say ET_EDITOR_REQUESTED once more: shown each time, it looped, hundreds a second)
     pub editor_req: (String, String, Option<std::time::Instant>),
+    /// #1389's fallback: the library editor KiCad last opened (ET_FRAME_OPENED) and when; the library editor the hub itself last asked
+    /// for (a show or an attach) and when; the fallback's turn (each show request or editor request starts a new one, so only the
+    /// latest's timer acts) and when KiCad last asked to show a library editor
+    pub lib_opened: Option<(String, std::time::Instant)>, pub lib_asked: Option<(String, std::time::Instant)>,
+    pub lib_wait: (u64, Option<std::time::Instant>),
 }
 
 impl Session {
@@ -133,7 +138,7 @@ impl Session {
             container: 0, toplevel: 0, holder: 0, display: String::new(), start_phase: String::new(), start_at: 0, lock_ask: Value::Null,
             sock: String::new(), events_sock: String::new(), sock_dir: String::new(),
             argv: String::new(), cli: String::new(), version: String::new(), desc: String::new(),
-            caps: vec![], frames: vec![], missed_pings: 0, dialogs: vec![], notices: vec![], drawn: vec![], keys: vec![], rss_mb: 0, peak_mb: 0, mem_pub: (0, 0), peak_logged: false, stop_reason: String::new(), stopped_at: 0, closed_frames: vec![], pane_cid: String::new(), task_wait: String::new(), parked: false, touched_at: now, closing: false, lost_parent: false, editor_req: (String::new(), String::new(), None),
+            caps: vec![], frames: vec![], missed_pings: 0, dialogs: vec![], notices: vec![], drawn: vec![], keys: vec![], rss_mb: 0, peak_mb: 0, mem_pub: (0, 0), peak_logged: false, stop_reason: String::new(), stopped_at: 0, closed_frames: vec![], pane_cid: String::new(), task_wait: String::new(), parked: false, touched_at: now, closing: false, lost_parent: false, editor_req: (String::new(), String::new(), None), lib_opened: None, lib_asked: None, lib_wait: (0, None),
         }
     }
     pub fn spawned(mut self, pid: u32) -> Self { self.pid = pid; self }
@@ -547,6 +552,31 @@ fn show_not_followed(by_actor: bool, actor: &str, editor: bool, other: bool, hel
     if by_actor && !actor.is_empty() && !actor.starts_with("person:") { return Some("an API client's") }
     if !editor && other && held && (!by_actor || actor.is_empty()) { return Some("while the hub drives it") }
     None
+}
+
+/// #1389: how long after KiCad's opening of a library editor (ET_FRAME_OPENED) its show request counts as that fresh open's.
+pub const LIB_FRESH: Duration = Duration::from_millis(1500);
+/// #1389: how long a library editor the hub itself asked for (a show, an attach) is the hub's open in flight.
+pub const LIB_ASKED: Duration = Duration::from_secs(5);
+/// #1389: how long after KiCad's last show request for a fresh library editor the hub waits for its ET_EDITOR_REQUESTED before it
+/// follows the show itself. Measured from the last ET_SHOW_REQUESTED to Footprint's ET_EDITOR_REQUESTED on Ctrl+E: Windows bp.13.2
+/// 482, 723, 535 ms (Carbon, 864e77dba9); see the PR for Linux and macOS.
+pub const LIB_EDITOR_WAIT: Duration = Duration::from_millis(1000);
+/// #1389: whether KiCad's plain show request for library editor `kind` waits for the fallback (followed after LIB_EDITOR_WAIT unless its
+/// ET_EDITOR_REQUESTED comes first). Bare Windows bp.13.2 opens the Symbol Editor on Ctrl+E without ET_EDITOR_REQUESTED (Footprint
+/// sends it), and with embed-editor-requested a library editor's plain show was never followed: the pane stayed on the schematic.
+/// Only for a fresh open by KiCad (its ET_FRAME_OPENED of that kind just before), never one the hub asked for itself (a show or an
+/// attach of it in flight), and only while a pane holds KiCad (never during a start with no pane, never a warm-up's frames). Pure.
+/// The hub itself asks for `frame` (a show, an attach): a library editor's open is the hub's, never followed as KiCad's (lib_show_fallback).
+fn note_lib_asked(s: &mut Session, frame: &str) {
+    let k = canon_frame(frame);
+    if matches!(k, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR") { s.lib_asked = Some((k.to_string(), std::time::Instant::now())); }
+}
+fn lib_show_fallback(kind: &str, opened: Option<&(String, std::time::Instant)>, asked: Option<&(String, std::time::Instant)>, pane_holds: bool, now: std::time::Instant) -> bool {
+    matches!(kind, "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR")
+        && pane_holds
+        && opened.is_some_and(|(k, t)| k == kind && now.saturating_duration_since(*t) <= LIB_FRESH)
+        && !asked.is_some_and(|(k, t)| k == kind && now.saturating_duration_since(*t) <= LIB_ASKED)
 }
 
 /// ET_EDITOR_REQUESTED (25): the editor's kind and the item (FrameInfo.lib_id, "Lib:Name") to open in it.
@@ -1700,6 +1730,8 @@ enum Msg {
     FramesUpdated { pro: String, gen: u64, holder: Option<u64>, frames: Vec<Frame>, reply: Option<(u64, oneshot::Sender<Result<Value, String>>)> },
     /// `editor`: KiCad's ET_EDITOR_REQUESTED (a library editor with the item it is for), not a plain ET_SHOW_REQUESTED
     ForkShowRequested { pro: String, gen: u64, kind: String, item: String, editor: bool, actor: String },
+    /// #1389's fallback: KiCad's show request for library editor `kind` (turn `turn` of `lib_wait`) had no editor request after it
+    LibShowFallback { pro: String, gen: u64, kind: String, turn: u64 },
     Dialog { pro: String, gen: u64, open: bool, title: String },
     /// the dialogs of KiCad's the client sees on screen (a modal one stops KiCad's events and pings: this is how the hub learns of it)
     ClientDialogs { pro: String, open: Vec<String> },
@@ -1973,6 +2005,7 @@ impl Actor {
                 if toplevel > 0 { existing.toplevel = toplevel; }
                 if !display.is_empty() { existing.display = display; }
                 existing.active = canon_frame(&frame).into();
+                note_lib_asked(existing, &frame);
                 existing.touched_at = now; existing.parked = false;
                 let snap = existing.clone();
                 if wait {
@@ -1993,6 +2026,7 @@ impl Actor {
                 if toplevel > 0 { existing.toplevel = toplevel; }
                 if !display.is_empty() { existing.display = display; }
                 existing.active = canon_frame(&frame).into();
+                note_lib_asked(existing, &frame);
                 existing.touched_at = now; existing.parked = false;
                 let snap = existing.clone();
                 // the client's kept container again (its last View kept KiCad's frames in it): nothing to re-parent, and a realized frame is the
@@ -2184,6 +2218,7 @@ impl Actor {
         if let Some(why) = frame_refused(&frame, &s.caps) { let _ = reply.send(Err(why.into())); return; }
         if s.state == "starting" {
             s.active = canon_frame(&frame).into();
+            note_lib_asked(s, &frame);
             s.touched_at = ipc::now_s();
             let snap = s.clone();
             let out = snap.info_json();
@@ -2194,6 +2229,7 @@ impl Actor {
             let _ = reply.send(Err(format!("KiCad is {} ({})", s.state, s.reason))); return;
         }
         s.active = canon_frame(&frame).into();
+        note_lib_asked(s, &frame);
         s.touched_at = ipc::now_s();
         let snap = s.clone();
         let me = self.me.clone();
@@ -2460,6 +2496,7 @@ impl Actor {
             Msg::CloseRefused { pro, gen } => { if let Some(s) = self.sessions.get_mut(&pro).filter(|s| s.gen == gen && s.is_live()) { s.stop_reason.clear(); } }
             Msg::FrameOpen { pro, gen, kind, open } => {
                 let Some(s) = self.sessions.get_mut(&pro).filter(|s| s.gen == gen) else { return };
+                if open && matches!(kind.as_str(), "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR") { s.lib_opened = Some((kind.clone(), std::time::Instant::now())); }
                 if !closed_frames_apply(s, &kind, open) { return }
                 let snap = s.clone();
                 self.publish(&snap, None);
@@ -2645,12 +2682,42 @@ impl Actor {
                 // only those are followed (the hub's own pre-warm, check runs and an agent's actions never move the person's pane); one with
                 // no actor while the hub drives KiCad (hold_shows) is KiCad's own and not followed either (show_not_followed)
                 let by_actor = s.caps.iter().any(|c| c == "embed-request-actor");
-                if let Some(why) = show_not_followed(by_actor, &actor, editor, canon_frame(&kind) != s.active, shows_held(&pro)) {
+                let why = show_not_followed(by_actor, &actor, editor, canon_frame(&kind) != s.active, shows_held(&pro));
+                let lib = matches!(canon_frame(&kind), "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR");
+                let now = std::time::Instant::now();
+                if lib && editor {
+                    // the editor request is here: no fallback for the show requests before it (one show, as without the fallback)
+                    if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() {
+                        eprintln!("kicad embed: {pro}: {kind} editor request {} ms after KiCad's last show request for it", s.lib_wait.1.map_or(-1, |t| now.duration_since(t).as_millis() as i64));
+                    }
+                    s.lib_wait = (s.lib_wait.0 + 1, None);
+                }
+                if lib && !editor && why != Some("an API client's") && s.caps.iter().any(|c| c == "embed-editor-requested") {
+                    // #1389: a fresh open by KiCad whose ET_EDITOR_REQUESTED may never come (bare Windows bp.13.2's Symbol Editor on Ctrl+E):
+                    // followed after LIB_EDITOR_WAIT from KiCad's last show request unless the editor request comes first (lib_show_fallback)
+                    let k = canon_frame(&kind).to_string();
+                    let pane_holds = !s.pane_cid.is_empty() && s.container != 0 && !s.parked;
+                    if s.active != k && lib_show_fallback(&k, s.lib_opened.as_ref(), s.lib_asked.as_ref(), pane_holds, now) {
+                        s.lib_wait = (s.lib_wait.0 + 1, Some(now));
+                        let (me, turn, p2) = (self.me.clone(), s.lib_wait.0, pro.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(LIB_EDITOR_WAIT).await;
+                            let _ = me.send(Msg::LibShowFallback { pro: p2, gen, kind: k, turn });
+                        });
+                    } else if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() {
+                        eprintln!("kicad embed: {pro}: KiCad asked to show {kind}: waits for its editor request (fresh open {}, hub asked {}, pane {pane_holds}, active {})",
+                            s.lib_opened.as_ref().is_some_and(|(o, t)| *o == k && now.saturating_duration_since(*t) <= LIB_FRESH),
+                            s.lib_asked.as_ref().is_some_and(|(o, t)| *o == k && now.saturating_duration_since(*t) <= LIB_ASKED), s.active);
+                    }
+                    let _ = self.me.send(Msg::ForkSync { pro, gen });
+                    return;
+                }
+                if let Some(why) = why {
                     eprintln!("kicad embed: {pro}: KiCad asked to show {kind} ({why}, actor {actor:?}): not followed");
                     let _ = self.me.send(Msg::ForkSync { pro, gen });
                     return;
                 }
-                if !editor && matches!(canon_frame(&kind), "SYMBOL_EDITOR" | "FOOTPRINT_EDITOR") && s.caps.iter().any(|c| c == "embed-editor-requested") {
+                if !editor && lib && s.caps.iter().any(|c| c == "embed-editor-requested") {
                     let _ = self.me.send(Msg::ForkSync { pro, gen });
                     return;
                 }
@@ -2668,6 +2735,24 @@ impl Actor {
                 let me = self.me.clone();
                 tokio::spawn(async move {
                     if let Ok(Some((holder, _, frames))) = switch_fork_frame(&me, &snap.sock, &snap.desc, &snap.active, "", &item, false, false).await {
+                        let _ = me.send(Msg::FramesUpdated { pro: snap.pro, gen: snap.gen, holder: Some(holder), frames, reply: None });
+                    }
+                });
+            }
+            Msg::LibShowFallback { pro, gen, kind, turn } => {
+                let Some(s) = self.sessions.get_mut(&pro).filter(|s| s.gen == gen && s.state == "ready") else { return };
+                // an editor request or a newer show request since: theirs; on show already, or the pane gone: nothing to follow
+                if s.lib_wait.0 != turn || s.active == kind || s.pane_cid.is_empty() || s.container == 0 || s.parked { return }
+                eprintln!("kicad embed: {pro}: KiCad's {kind} show request had no editor request in {} ms: followed (#1389)", LIB_EDITOR_WAIT.as_millis());
+                s.lib_wait.1 = None;
+                s.editor_req = Default::default();
+                s.active = kind;
+                let snap = s.clone();
+                let me = self.me.clone();
+                // as an editor request is followed: ShowFrame without focus; the client follows the hub's active frame and moves no keys
+                // (Ctrl+E was typed in KiCad: the keyboard stays KiCad's, in the editor it opened)
+                tokio::spawn(async move {
+                    if let Ok(Some((holder, _, frames))) = switch_fork_frame(&me, &snap.sock, &snap.desc, &snap.active, "", "", false, false).await {
                         let _ = me.send(Msg::FramesUpdated { pro: snap.pro, gen: snap.gen, holder: Some(holder), frames, reply: None });
                     }
                 });
@@ -4569,6 +4654,84 @@ mod tests {
         assert!(!crate::plat::proc::alive(old), "the old KiCad is gone");
         first.abort(); again.abort();
         if let Ok(p) = std::fs::read_to_string(&pidf) { if let Ok(p) = p.trim().parse::<u32>() { crate::plat::proc::kill_group(p, crate::plat::proc::KILL); } }
+    }
+
+    /// #1389's fallback, pure: a fresh open by KiCad in a pane is followed; the hub's own open, an old open, another kind, no pane are not.
+    #[test] fn a_library_editor_kicad_opened_itself_is_followed_only_when_fresh_and_not_the_hubs() {
+        let now = std::time::Instant::now();
+        let at = |ms: u64| now - Duration::from_millis(ms);
+        let o = |k: &str, ms: u64| Some((k.to_string(), at(ms)));
+        assert!(lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, true, now));
+        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), None, false, now), "no pane: never");
+        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 3000).as_ref(), None, true, now), "an open long before: not this show's");
+        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("FOOTPRINT_EDITOR", 0).as_ref(), None, true, now), "another editor opened");
+        assert!(!lib_show_fallback("SYMBOL_EDITOR", None, None, true, now), "no open seen");
+        assert!(!lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 500).as_ref(), true, now), "the hub asked for it");
+        assert!(lib_show_fallback("SYMBOL_EDITOR", o("SYMBOL_EDITOR", 0).as_ref(), o("SYMBOL_EDITOR", 6000).as_ref(), true, now), "the hub's ask long done");
+        assert!(lib_show_fallback("FOOTPRINT_EDITOR", o("FOOTPRINT_EDITOR", 100).as_ref(), o("SYMBOL_EDITOR", 0).as_ref(), true, now));
+        assert!(!lib_show_fallback("SCH", o("SCH", 0).as_ref(), None, true, now), "only library editors");
+    }
+
+    /// #1389's fallback through the actor, as a stand-in KiCad's events reach it: opened + show with no editor request is followed once
+    /// (after LIB_EDITOR_WAIT); with the editor request it is not followed a second time; a library editor the hub asked for is not
+    /// followed as KiCad's; the pre-warm's hold does not stop the person's fresh open.
+    #[tokio::test] async fn kicads_library_editor_show_without_its_editor_request_is_followed_once() {
+        let base = crate::plat::tmp::short_dir("ke-lib");
+        std::fs::create_dir_all(base.join("home")).unwrap();
+        let cfg = crate::hub::Cfg { home: base.join("home"), version: "0.14.0".into(), commit: "test".into(), listen: "127.0.0.1:0".into(), os: "linux".into(), arch: "x64".into() };
+        let hub = Hub::start(cfg, Arc::new(crate::presenter::Canned { reply: json!({}) })).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (info_tx, _info_rx) = mpsc::unbounded_channel();
+        let mut a = Actor {
+            hub: hub.clone(), me: tx.clone(), info_tx, helper: None, hgen: 0, next_id: 0, next_gen: 0,
+            pend: HashMap::new(), sessions: HashMap::new(), attach_waiters: HashMap::new(), start_env: HashMap::new(), start_retried: Default::default(), lock_waits: HashMap::new(),
+            users: HashSet::new(), users_gone: None,
+        };
+        let pro = base.join("p/lib.kicad_pro").to_string_lossy().to_string();
+        let mut s = Session::new(&pro, "/p", "fork", "SCH", 1, 0).ready(&base.join("none.sock").to_string_lossy(), "", 0);
+        s.caps = vec!["embed-editor-requested".into(), "embed-request-actor".into()];
+        s.container = 9001; s.pane_cid = "c1".into();
+        a.sessions.insert(pro.clone(), s);
+        // what the actor sent itself within `ms`: the fallbacks due (their turns)
+        async fn fallbacks(rx: &mut mpsc::UnboundedReceiver<Msg>, ms: u64) -> Vec<Msg> {
+            let mut out = vec![];
+            let end = tokio::time::Instant::now() + Duration::from_millis(ms);
+            while let Ok(Some(m)) = tokio::time::timeout_at(end, rx.recv()).await { if matches!(m, Msg::LibShowFallback { .. }) { out.push(m) } }
+            out
+        }
+        let show = |editor: bool, item: &str| Msg::ForkShowRequested { pro: pro.clone(), gen: 1, kind: "SYMBOL_EDITOR".into(), item: item.into(), editor, actor: String::new() };
+        let opened = || Msg::FrameOpen { pro: pro.clone(), gen: 1, kind: "SYMBOL_EDITOR".into(), open: true };
+        let wait = LIB_EDITOR_WAIT.as_millis() as u64 + 400;
+
+        // 1. opened + two shows, no editor request, under the pre-warm's hold: followed once, the last show's turn
+        hold_shows(&pro, Duration::from_secs(60));
+        a.handle(opened()); a.handle(show(false, "")); a.handle(show(false, ""));
+        let due = fallbacks(&mut rx, wait).await;
+        assert_eq!(due.len(), 2, "one timer per show request");
+        for m in due { a.handle(m); }
+        assert_eq!(a.sessions[&pro].active, "SYMBOL_EDITOR", "followed");
+        let turn = a.sessions[&pro].lib_wait.0;
+        assert_eq!(turn, 2, "only the last show's timer acted (the first was stale)");
+
+        // 2. back on the schematic; opened + show, then the editor request within the wait: shown on the request, no second show
+        a.sessions.get_mut(&pro).unwrap().active = "SCH".into();
+        a.handle(opened()); a.handle(show(false, "")); a.handle(show(true, "Device:R"));
+        assert_eq!(a.sessions[&pro].active, "SYMBOL_EDITOR");
+        assert_eq!(a.sessions[&pro].editor_req.1, "Device:R");
+        for m in fallbacks(&mut rx, wait).await { a.handle(m); }
+        assert_eq!(a.sessions[&pro].editor_req.1, "Device:R", "the fallback did not show it a second time");
+
+        // 3. the hub asked for the Symbol Editor itself: KiCad's open and show are not followed as KiCad's
+        a.sessions.get_mut(&pro).unwrap().active = "SCH".into();
+        note_lib_asked(a.sessions.get_mut(&pro).unwrap(), "SYMBOL_EDITOR");
+        a.handle(opened()); a.handle(show(false, ""));
+        assert!(fallbacks(&mut rx, wait).await.is_empty(), "the hub's own open is not followed by the fallback");
+        assert_eq!(a.sessions[&pro].active, "SCH");
+
+        // 4. no pane: never
+        { let s = a.sessions.get_mut(&pro).unwrap(); s.lib_asked = None; s.pane_cid.clear(); }
+        a.handle(opened()); a.handle(show(false, ""));
+        assert!(fallbacks(&mut rx, wait).await.is_empty(), "no pane holds KiCad: not followed");
     }
 
     #[test] fn a_shown_project_is_kept_warm_within_the_cap_memory_and_locks() {
