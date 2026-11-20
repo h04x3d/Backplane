@@ -762,6 +762,9 @@ impl KicadPane {
         if let Some(act) = info["active"].as_str().filter(|a| !a.is_empty()) {
             if self.pending_show.as_deref() == Some(act) {
                 self.pending_show = None;
+            } else if Some(act) != self.info["active"].as_str() && self.pending_show.is_some() && std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() {
+                // #1389's measurement: the hub's active frame changed and the pane does not follow it (a show of its own is pending)
+                eprintln!("GPUI_LOG {}", json!({"kicad_active_not_followed": {"active": act, "prev_active": self.info["active"], "pending_show": self.pending_show, "tab": self.tab(), "override": self.override_kind}}));
             } else if self.pending_show.is_none() && Some(act) != self.info["active"].as_str() {
                 self.override_kind = (act != frame_for(&self.open)).then(|| act.to_string());
                 cause = format!("hub info active {} -> {act} (KiCad's active frame)", self.info["active"]); // i18n-ok: a debug log cause (BACKPLANE_KICAD_DEBUG)
@@ -1063,7 +1066,7 @@ impl KicadPane {
                     if let Some((stray, title)) = nc::invisible_kicad_foreground(w) {
                         if stray != last_stray {
                             last = stray;
-                            eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "title": title, "during": "prewarm", "after_prewarm_request_ms": started.elapsed().as_millis() as u64}}));
+                            eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "during": "prewarm", "after_prewarm_request_ms": started.elapsed().as_millis() as u64}}));
                             nc::focus(w);
                         }
                     }
@@ -1146,6 +1149,7 @@ impl KicadPane {
                         self.poked = Some((want.clone(), std::time::Instant::now()));
                         self.unmapped_since = None;
                         self.placed = None;
+                        if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() { eprintln!("GPUI_LOG {}", json!({"kicad_remount": {"why": "placed frame stayed unmapped", "frame": &want, "hub_active": self.info["active"], "pending_show": self.pending_show}})); }
                         self.rpc("editor.kicad.show", json!({"project": self.project, "frame": &want, "remount": true, "focus": self.keys}));
                     }
                 } else {
@@ -1168,6 +1172,7 @@ impl KicadPane {
             {
                 if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() { eprintln!("GPUI_LOG {}", json!({"kicad_unshown": want, "ms": since.elapsed().as_millis() as u64})); }
                 self.poked = Some((want.clone(), std::time::Instant::now()));
+                if std::env::var_os("BACKPLANE_KICAD_DEBUG").is_some() { eprintln!("GPUI_LOG {}", json!({"kicad_remount": {"why": "wanted frame exists but was never shown", "frame": &want, "hub_active": self.info["active"], "pending_show": self.pending_show}})); }
                 self.rpc("editor.kicad.show", json!({"project": self.project, "frame": &want, "remount": true, "focus": self.keys}));
             }
         } else {
@@ -1388,7 +1393,7 @@ impl KicadPane {
             if !self.keys || show != Some(w) || since.elapsed() > std::time::Duration::from_millis(1500) { self.verify_handin = None; }
             else if let Some((stray, title)) = nc::invisible_kicad_foreground(w) {
                 self.verify_handin = None;
-                eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "title": title, "after_ms": since.elapsed().as_millis() as u64}}));
+                eprintln!("GPUI_LOG {}", json!({"kicad_stray_foreground": {"frame": w, "stray": stray, "own_frame": self.info["frames"].as_array().into_iter().flatten().any(|f| f["xid"].as_u64() == Some(stray)) || self.frames.iter().any(|f| f.window == stray), "stray_kind": self.info["frames"].as_array().into_iter().flatten().find(|f| f["xid"].as_u64() == Some(stray)).map(|f| f["kind"].clone()).or_else(|| self.frames.iter().find(|f| f.window == stray).map(|f| json!(f.kind))), "hub_active": self.info["active"], "title": title, "after_ms": since.elapsed().as_millis() as u64}}));
                 nc::focus(w);
             } else { cx.notify(); }
         }
