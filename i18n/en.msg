@@ -4706,3 +4706,5 @@ viewer.layout.refusal.invalidratio = Invalid split ratio
 viewer.layout.refusal.duplicateid = Tile already exists
 viewer.layout.refusal.unknownframe = Unknown KiCad frame
 viewer.layout.refusal.invalidinput = Invalid layout request
+viewer.footprinteditor = Footprint Editor
+viewer.symboleditor = Symbol Editor

@@ -4572,6 +4572,8 @@ viewer.layout.refusal.invalidratio	Invalid split ratio	分割比率が無効で�
 viewer.layout.refusal.duplicateid	Tile already exists	タイルは既に存在します	El panel ya existe
 viewer.layout.refusal.unknownframe	Unknown KiCad frame	不明な KiCad フレームです	Marco de KiCad desconocido
 viewer.layout.refusal.invalidinput	Invalid layout request	無効なレイアウト要求です	Solicitud de diseño no válida
+viewer.footprinteditor	Footprint Editor	フットプリントエディター	Editor de huellas
+viewer.symboleditor	Symbol Editor	シンボルエディター	Editor de símbolos
 """#
 
     /// thread.count = {n, plural, one {# thread} other {# threads}}

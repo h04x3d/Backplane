@@ -4704,3 +4704,5 @@ viewer.layout.refusal.invalidratio = Proporción de división no válida
 viewer.layout.refusal.duplicateid = El panel ya existe
 viewer.layout.refusal.unknownframe = Marco de KiCad desconocido
 viewer.layout.refusal.invalidinput = Solicitud de diseño no válida
+viewer.footprinteditor = Editor de huellas
+viewer.symboleditor = Editor de símbolos
